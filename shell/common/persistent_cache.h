@@ -15,7 +15,7 @@
 #include "flutter/fml/unique_fd.h"
 #include "third_party/skia/include/gpu/GrContextOptions.h"
 
-namespace shell {
+namespace flutter {
 
 class PersistentCache : public GrContextOptions::PersistentCache {
  public:
@@ -36,6 +36,15 @@ class PersistentCache : public GrContextOptions::PersistentCache {
 
   void RemoveWorkerTaskRunner(fml::RefPtr<fml::TaskRunner> task_runner);
 
+  // Whether Skia tries to store any shader into this persistent cache after
+  // |ResetStoredNewShaders| is called. This flag is usually reset before each
+  // frame so we can know if Skia tries to compile new shaders in that frame.
+  bool StoredNewShaders() const { return stored_new_shaders_; }
+  void ResetStoredNewShaders() { stored_new_shaders_ = false; }
+  void DumpSkp(const SkData& data);
+  bool IsDumpingSkp() const { return is_dumping_skp_; }
+  void SetIsDumpingSkp(bool value) { is_dumping_skp_ = value; }
+
  private:
   static std::string cache_base_path_;
 
@@ -44,6 +53,9 @@ class PersistentCache : public GrContextOptions::PersistentCache {
   mutable std::mutex worker_task_runners_mutex_;
   std::multiset<fml::RefPtr<fml::TaskRunner>> worker_task_runners_
       FML_GUARDED_BY(worker_task_runners_mutex_);
+
+  bool stored_new_shaders_ = false;
+  bool is_dumping_skp_ = false;
 
   bool IsValid() const;
 
@@ -60,6 +72,6 @@ class PersistentCache : public GrContextOptions::PersistentCache {
   FML_DISALLOW_COPY_AND_ASSIGN(PersistentCache);
 };
 
-}  // namespace shell
+}  // namespace flutter
 
 #endif  // FLUTTER_SHELL_COMMON_PERSISTENT_CACHE_H_

@@ -7,6 +7,7 @@ package io.flutter.view;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -15,8 +16,8 @@ import android.graphics.SurfaceTexture;
 import android.os.Build;
 import android.os.Handler;
 import android.os.LocaleList;
-import android.provider.Settings;
 import android.support.annotation.RequiresApi;
+import android.support.annotation.UiThread;
 import android.text.format.DateFormat;
 import android.util.AttributeSet;
 import android.util.Log;
@@ -28,8 +29,10 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import io.flutter.app.FlutterPluginRegistry;
 import io.flutter.embedding.engine.FlutterJNI;
-import io.flutter.embedding.engine.android.AndroidKeyProcessor;
+import io.flutter.embedding.android.AndroidKeyProcessor;
+import io.flutter.embedding.android.AndroidTouchProcessor;
 import io.flutter.embedding.engine.dart.DartExecutor;
+import io.flutter.embedding.engine.renderer.FlutterRenderer;
 import io.flutter.embedding.engine.systemchannels.AccessibilityChannel;
 import io.flutter.embedding.engine.systemchannels.KeyEventChannel;
 import io.flutter.embedding.engine.systemchannels.LifecycleChannel;
@@ -41,6 +44,7 @@ import io.flutter.embedding.engine.systemchannels.SystemChannel;
 import io.flutter.plugin.common.*;
 import io.flutter.plugin.editing.TextInputPlugin;
 import io.flutter.plugin.platform.PlatformPlugin;
+import io.flutter.plugin.platform.PlatformViewsController;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -88,6 +92,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     }
 
     private final DartExecutor dartExecutor;
+    private final FlutterRenderer flutterRenderer;
     private final NavigationChannel navigationChannel;
     private final KeyEventChannel keyEventChannel;
     private final LifecycleChannel lifecycleChannel;
@@ -98,6 +103,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     private final InputMethodManager mImm;
     private final TextInputPlugin mTextInputPlugin;
     private final AndroidKeyProcessor androidKeyProcessor;
+    private final AndroidTouchProcessor androidTouchProcessor;
     private AccessibilityBridge mAccessibilityNodeProvider;
     private final SurfaceHolder.Callback mSurfaceCallback;
     private final ViewportMetrics mMetrics;
@@ -125,7 +131,11 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     public FlutterView(Context context, AttributeSet attrs, FlutterNativeView nativeView) {
         super(context, attrs);
 
-        Activity activity = (Activity) getContext();
+        Activity activity = getActivity(getContext());
+        if (activity == null) {
+            throw new IllegalArgumentException("Bad context");
+        }
+
         if (nativeView == null) {
             mNativeView = new FlutterNativeView(activity.getApplicationContext());
         } else {
@@ -133,6 +143,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
         }
 
         dartExecutor = mNativeView.getDartExecutor();
+        flutterRenderer = new FlutterRenderer(mNativeView.getFlutterJNI());
         mIsSoftwareRenderingEnabled = FlutterJNI.nativeGetIsSoftwareRenderingEnabled();
         mMetrics = new ViewportMetrics();
         mMetrics.devicePixelRatio = context.getResources().getDisplayMetrics().density;
@@ -180,10 +191,25 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
         mImm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
         mTextInputPlugin = new TextInputPlugin(this, dartExecutor);
         androidKeyProcessor = new AndroidKeyProcessor(keyEventChannel, mTextInputPlugin);
+        androidTouchProcessor = new AndroidTouchProcessor(flutterRenderer);
 
         // Send initial platform information to Dart
         sendLocalesToDart(getResources().getConfiguration());
         sendUserPlatformSettingsToDart();
+    }
+    
+    private static Activity getActivity(Context context) {
+        if (context == null) {
+            return null;
+        }
+        if (context instanceof Activity) {
+            return (Activity) context;
+        }
+        if (context instanceof ContextWrapper) {
+            // Recurse up chain of base contexts until we find an Activity.
+            return getActivity(((ContextWrapper) context).getBaseContext());
+        }
+        return null;
     }
 
     @Override
@@ -340,7 +366,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
         if (!isAttached())
             return null;
         getHolder().removeCallback(mSurfaceCallback);
-        mNativeView.detach();
+        mNativeView.detachFromFlutterView();
 
         FlutterNativeView view = mNativeView;
         mNativeView = null;
@@ -362,151 +388,10 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
         return mTextInputPlugin.createInputConnection(this, outAttrs);
     }
 
-    // Must match the PointerChange enum in pointer.dart.
-    private static final int kPointerChangeCancel = 0;
-    private static final int kPointerChangeAdd = 1;
-    private static final int kPointerChangeRemove = 2;
-    private static final int kPointerChangeHover = 3;
-    private static final int kPointerChangeDown = 4;
-    private static final int kPointerChangeMove = 5;
-    private static final int kPointerChangeUp = 6;
-
-    // Must match the PointerDeviceKind enum in pointer.dart.
-    private static final int kPointerDeviceKindTouch = 0;
-    private static final int kPointerDeviceKindMouse = 1;
-    private static final int kPointerDeviceKindStylus = 2;
-    private static final int kPointerDeviceKindInvertedStylus = 3;
-    private static final int kPointerDeviceKindUnknown = 4;
-
-    // Must match the PointerSignalKind enum in pointer.dart.
-    private static final int kPointerSignalKindNone = 0;
-    private static final int kPointerSignalKindScroll = 1;
-    private static final int kPointerSignalKindUnknown = 2;
-
-    // These values must match the unpacking code in hooks.dart.
-    private static final int kPointerDataFieldCount = 24;
-    private static final int kPointerBytesPerField = 8;
-
-    private int getPointerChangeForAction(int maskedAction) {
-        // Primary pointer:
-        if (maskedAction == MotionEvent.ACTION_DOWN) {
-            return kPointerChangeDown;
-        }
-        if (maskedAction == MotionEvent.ACTION_UP) {
-            return kPointerChangeUp;
-        }
-        // Secondary pointer:
-        if (maskedAction == MotionEvent.ACTION_POINTER_DOWN) {
-            return kPointerChangeDown;
-        }
-        if (maskedAction == MotionEvent.ACTION_POINTER_UP) {
-            return kPointerChangeUp;
-        }
-        // All pointers:
-        if (maskedAction == MotionEvent.ACTION_MOVE) {
-            return kPointerChangeMove;
-        }
-        if (maskedAction == MotionEvent.ACTION_HOVER_MOVE) {
-            return kPointerChangeHover;
-        }
-        if (maskedAction == MotionEvent.ACTION_CANCEL) {
-            return kPointerChangeCancel;
-        }
-        return -1;
-    }
-
-    private int getPointerDeviceTypeForToolType(int toolType) {
-        switch (toolType) {
-        case MotionEvent.TOOL_TYPE_FINGER:
-            return kPointerDeviceKindTouch;
-        case MotionEvent.TOOL_TYPE_STYLUS:
-            return kPointerDeviceKindStylus;
-        case MotionEvent.TOOL_TYPE_MOUSE:
-            return kPointerDeviceKindMouse;
-        case MotionEvent.TOOL_TYPE_ERASER:
-            return kPointerDeviceKindInvertedStylus;
-        default:
-            // MotionEvent.TOOL_TYPE_UNKNOWN will reach here.
-            return kPointerDeviceKindUnknown;
-        }
-    }
-
-    private void addPointerForIndex(MotionEvent event, int pointerIndex, int pointerChange,
-                                    int pointerData, ByteBuffer packet) {
-        if (pointerChange == -1) {
-            return;
-        }
-
-        int pointerKind = getPointerDeviceTypeForToolType(event.getToolType(pointerIndex));
-
-        int signalKind = kPointerSignalKindNone;
-
-        long timeStamp = event.getEventTime() * 1000; // Convert from milliseconds to microseconds.
-
-        packet.putLong(timeStamp); // time_stamp
-        packet.putLong(pointerChange); // change
-        packet.putLong(pointerKind); // kind
-        packet.putLong(signalKind); // signal_kind
-        packet.putLong(event.getPointerId(pointerIndex)); // device
-        packet.putDouble(event.getX(pointerIndex)); // physical_x
-        packet.putDouble(event.getY(pointerIndex)); // physical_y
-
-        if (pointerKind == kPointerDeviceKindMouse) {
-            packet.putLong(event.getButtonState() & 0x1F); // buttons
-        } else if (pointerKind == kPointerDeviceKindStylus) {
-            packet.putLong((event.getButtonState() >> 4) & 0xF); // buttons
-        } else {
-            packet.putLong(0); // buttons
-        }
-
-        packet.putLong(0); // obscured
-
-        packet.putDouble(event.getPressure(pointerIndex)); // pressure
-        double pressureMin = 0.0, pressureMax = 1.0;
-        if (event.getDevice() != null) {
-            InputDevice.MotionRange pressureRange = event.getDevice().getMotionRange(MotionEvent.AXIS_PRESSURE);
-            if (pressureRange != null) {
-                pressureMin = pressureRange.getMin();
-                pressureMax = pressureRange.getMax();
-            }
-        }
-        packet.putDouble(pressureMin); // pressure_min
-        packet.putDouble(pressureMax); // pressure_max
-
-        if (pointerKind == kPointerDeviceKindStylus) {
-            packet.putDouble(event.getAxisValue(MotionEvent.AXIS_DISTANCE, pointerIndex)); // distance
-            packet.putDouble(0.0); // distance_max
-        } else {
-            packet.putDouble(0.0); // distance
-            packet.putDouble(0.0); // distance_max
-        }
-
-        packet.putDouble(event.getSize(pointerIndex)); // size
-
-        packet.putDouble(event.getToolMajor(pointerIndex)); // radius_major
-        packet.putDouble(event.getToolMinor(pointerIndex)); // radius_minor
-
-        packet.putDouble(0.0); // radius_min
-        packet.putDouble(0.0); // radius_max
-
-        packet.putDouble(event.getAxisValue(MotionEvent.AXIS_ORIENTATION, pointerIndex)); // orientation
-
-        if (pointerKind == kPointerDeviceKindStylus) {
-            packet.putDouble(event.getAxisValue(MotionEvent.AXIS_TILT, pointerIndex)); // tilt
-        } else {
-            packet.putDouble(0.0); // tilt
-        }
-
-        packet.putLong(pointerData); // platformData
-
-        packet.putDouble(0.0); // scroll_delta_x
-        packet.putDouble(0.0); // scroll_delta_y
-    }
-
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         if (!isAttached()) {
-            return false;
+            return super.onTouchEvent(event);
         }
 
         // TODO(abarth): This version check might not be effective in some
@@ -518,55 +403,13 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
             requestUnbufferedDispatch(event);
         }
 
-        // This value must match the value in framework's platform_view.dart.
-        // This flag indicates whether the original Android pointer events were batched together.
-        final int kPointerDataFlagBatched = 1;
-
-        int pointerCount = event.getPointerCount();
-
-        ByteBuffer packet = ByteBuffer.allocateDirect(pointerCount * kPointerDataFieldCount * kPointerBytesPerField);
-        packet.order(ByteOrder.LITTLE_ENDIAN);
-
-        int maskedAction = event.getActionMasked();
-        int pointerChange = getPointerChangeForAction(event.getActionMasked());
-        if (maskedAction == MotionEvent.ACTION_DOWN || maskedAction == MotionEvent.ACTION_POINTER_DOWN) {
-            // ACTION_DOWN and ACTION_POINTER_DOWN always apply to a single pointer only.
-            addPointerForIndex(event, event.getActionIndex(), pointerChange, 0, packet);
-        } else if (maskedAction == MotionEvent.ACTION_UP || maskedAction == MotionEvent.ACTION_POINTER_UP) {
-            // ACTION_UP and ACTION_POINTER_UP may contain position updates for other pointers.
-            // We are converting these updates to move events here in order to preserve this data.
-            // We also mark these events with a flag in order to help the framework reassemble
-            // the original Android event later, should it need to forward it to a PlatformView.
-            for (int p = 0; p < pointerCount; p++) {
-                if (p != event.getActionIndex()) {
-                    if (event.getToolType(p) == MotionEvent.TOOL_TYPE_FINGER) {
-                        addPointerForIndex(event, p, kPointerChangeMove, kPointerDataFlagBatched, packet);
-                    }
-                }
-            }
-            // It's important that we're sending the UP event last. This allows PlatformView
-            // to correctly batch everything back into the original Android event if needed.
-            addPointerForIndex(event, event.getActionIndex(), pointerChange, 0, packet);
-        } else {
-            // ACTION_MOVE may not actually mean all pointers have moved
-            // but it's the responsibility of a later part of the system to
-            // ignore 0-deltas if desired.
-            for (int p = 0; p < pointerCount; p++) {
-                addPointerForIndex(event, p, pointerChange, 0, packet);
-            }
-        }
-
-        if (packet.position() % (kPointerDataFieldCount * kPointerBytesPerField) != 0) {
-          throw new AssertionError("Packet position is not on field boundary");
-        }
-        mNativeView.getFlutterJNI().dispatchPointerDataPacket(packet, packet.position());
-        return true;
+        return androidTouchProcessor.onTouchEvent(event);
     }
 
     @Override
     public boolean onHoverEvent(MotionEvent event) {
         if (!isAttached()) {
-            return false;
+            return super.onHoverEvent(event);
         }
 
         boolean handled = mAccessibilityNodeProvider.onAccessibilityHoverEvent(event);
@@ -577,30 +420,17 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
         return handled;
     }
 
+    /**
+     * Invoked by Android when a generic motion event occurs, e.g., joystick movement, mouse hover,
+     * track pad touches, scroll wheel movements, etc.
+     *
+     * Flutter handles all of its own gesture detection and processing, therefore this
+     * method forwards all {@link MotionEvent} data from Android to Flutter.
+     */
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
-        // Method isFromSource is only available in API 18+ (Jelly Bean MR2)
-        // Mouse hover support is not implemented for API < 18.
-        boolean isPointerEvent = Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2
-            && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER);
-        if (!isPointerEvent ||
-            event.getActionMasked() != MotionEvent.ACTION_HOVER_MOVE ||
-            !isAttached()) {
-            return super.onGenericMotionEvent(event);
-        }
-
-        int pointerChange = getPointerChangeForAction(event.getActionMasked());
-        ByteBuffer packet = ByteBuffer.allocateDirect(
-            event.getPointerCount() * kPointerDataFieldCount * kPointerBytesPerField);
-        packet.order(ByteOrder.LITTLE_ENDIAN);
-
-        // ACTION_HOVER_MOVE always applies to a single pointer only.
-        addPointerForIndex(event, event.getActionIndex(), pointerChange, 0, packet);
-        if (packet.position() % (kPointerDataFieldCount * kPointerBytesPerField) != 0) {
-          throw new AssertionError("Packet position is not on field boundary");
-        }
-        mNativeView.getFlutterJNI().dispatchPointerDataPacket(packet, packet.position());
-        return true;
+        boolean handled = isAttached() && androidTouchProcessor.onGenericMotionEvent(event);
+        return handled ? true : super.onGenericMotionEvent(event);
     }
 
     @Override
@@ -850,12 +680,13 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
 
+        PlatformViewsController platformViewsController = getPluginRegistry().getPlatformViewsController();
         mAccessibilityNodeProvider = new AccessibilityBridge(
             this,
-            getFlutterNativeView().getFlutterJNI(),
-            new AccessibilityChannel(dartExecutor),
+            new AccessibilityChannel(dartExecutor, getFlutterNativeView().getFlutterJNI()),
             (AccessibilityManager) getContext().getSystemService(Context.ACCESSIBILITY_SERVICE),
-            getContext().getContentResolver()
+            getContext().getContentResolver(),
+            platformViewsController
         );
         mAccessibilityNodeProvider.setOnAccessibilityChangeListener(onAccessibilityChangeListener);
 
@@ -884,7 +715,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
 
     @Override
     public AccessibilityNodeProvider getAccessibilityNodeProvider() {
-        if (mAccessibilityNodeProvider.isAccessibilityEnabled()) {
+        if (mAccessibilityNodeProvider != null && mAccessibilityNodeProvider.isAccessibilityEnabled()) {
             return mAccessibilityNodeProvider;
         } else {
             // TODO(goderbauer): when a11y is off this should return a one-off snapshot of
@@ -895,11 +726,13 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     }
 
     @Override
+    @UiThread
     public void send(String channel, ByteBuffer message) {
         send(channel, message, null);
     }
 
     @Override
+    @UiThread
     public void send(String channel, ByteBuffer message, BinaryReply callback) {
         if (!isAttached()) {
             Log.d(TAG, "FlutterView.send called on a detached view, channel=" + channel);
@@ -909,6 +742,7 @@ public class FlutterView extends SurfaceView implements BinaryMessenger, Texture
     }
 
     @Override
+    @UiThread
     public void setMessageHandler(String channel, BinaryMessageHandler handler) {
         mNativeView.setMessageHandler(channel, handler);
     }

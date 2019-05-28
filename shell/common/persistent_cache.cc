@@ -7,15 +7,15 @@
 #include <memory>
 #include <string>
 
-#include "flutter/common/version/version.h"
 #include "flutter/fml/base32.h"
 #include "flutter/fml/file.h"
 #include "flutter/fml/make_copyable.h"
 #include "flutter/fml/mapping.h"
 #include "flutter/fml/paths.h"
 #include "flutter/fml/trace_event.h"
+#include "flutter/shell/version/version.h"
 
-namespace shell {
+namespace flutter {
 
 std::string PersistentCache::cache_base_path_;
 
@@ -59,12 +59,11 @@ PersistentCache::PersistentCache(bool read_only) : is_read_only_(read_only) {
   }
 
   if (cache_base_dir.is_valid()) {
-    cache_directory_ = std::make_shared<fml::UniqueFD>(
-        CreateDirectory(cache_base_dir,
-                        {"flutter_engine", blink::GetFlutterEngineVersion(),
-                         "skia", blink::GetSkiaVersion()},
-                        read_only ? fml::FilePermission::kRead
-                                  : fml::FilePermission::kReadWrite));
+    cache_directory_ = std::make_shared<fml::UniqueFD>(CreateDirectory(
+        cache_base_dir,
+        {"flutter_engine", GetFlutterEngineVersion(), "skia", GetSkiaVersion()},
+        read_only ? fml::FilePermission::kRead
+                  : fml::FilePermission::kReadWrite));
   }
   if (!IsValid()) {
     FML_LOG(WARNING) << "Could not acquire the persistent cache directory. "
@@ -134,6 +133,8 @@ static void PersistentCacheStore(fml::RefPtr<fml::TaskRunner> worker,
 
 // |GrContextOptions::PersistentCache|
 void PersistentCache::store(const SkData& key, const SkData& data) {
+  stored_new_shaders_ = true;
+
   if (is_read_only_) {
     return;
   }
@@ -155,6 +156,24 @@ void PersistentCache::store(const SkData& key, const SkData& data) {
     return;
   }
 
+  PersistentCacheStore(GetWorkerTaskRunner(), cache_directory_,
+                       std::move(file_name), std::move(mapping));
+}
+
+void PersistentCache::DumpSkp(const SkData& data) {
+  if (is_read_only_ || !IsValid()) {
+    FML_LOG(ERROR) << "Could not dump SKP from read-only or invalid persistent "
+                      "cache.";
+    return;
+  }
+
+  std::stringstream name_stream;
+  auto ticks = fml::TimePoint::Now().ToEpochDelta().ToNanoseconds();
+  name_stream << "shader_dump_" << std::to_string(ticks) << ".skp";
+  std::string file_name = name_stream.str();
+  FML_LOG(INFO) << "Dumping " << file_name;
+  auto mapping = std::make_unique<fml::DataMapping>(
+      std::vector<uint8_t>{data.bytes(), data.bytes() + data.size()});
   PersistentCacheStore(GetWorkerTaskRunner(), cache_directory_,
                        std::move(file_name), std::move(mapping));
 }
@@ -185,4 +204,4 @@ fml::RefPtr<fml::TaskRunner> PersistentCache::GetWorkerTaskRunner() const {
   return worker;
 }
 
-}  // namespace shell
+}  // namespace flutter

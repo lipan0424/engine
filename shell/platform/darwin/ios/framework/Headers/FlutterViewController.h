@@ -23,6 +23,7 @@
  * The object passed as the sender is the `FlutterViewController` associated
  * with the update.
  */
+FLUTTER_EXPORT
 extern NSNotificationName const FlutterSemanticsUpdateNotification;
 
 /**
@@ -118,7 +119,7 @@ FLUTTER_EXPORT
 
 /**
  * Instructs the Flutter Navigator (if any) to push a route on to the navigation
- * stack.  The setInitialRoute method should be prefered if this is called before the
+ * stack.  The setInitialRoute method should be preferred if this is called before the
  * FlutterViewController has come into view.
  *
  * @param route The name of the route to push to the navigation stack.
